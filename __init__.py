@@ -428,6 +428,37 @@ class LadybugMemoryProvider(MemoryProvider):
         self._min_importance = int(plugin_cfg.get("min_importance", 3))
         self._auto_link = str(plugin_cfg.get("auto_link", "false")).lower() == "true"
 
+        # Single-writer guard: the ladybug storage engine is single-process —
+        # concurrent opens from multiple Hermes processes (gateway + CLI
+        # sessions) leave stale mmap regions and corrupt the DB file
+        # (SIGBUS inside FTS scans). Only the first process may open the
+        # graph DB; any other process degrades to the same no-graph-memory
+        # mode as a failed open (MEMORY.md/USER.md still work).
+        import fcntl
+        self._db_lock_fd = None
+        lock_path = self._db_path + ".lock"
+        lock_fd = None
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(lock_fd, 0)
+            os.write(lock_fd, str(os.getpid()).encode())
+        except OSError:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+            logger.warning(
+                "Ladybug DB %s is already open in another Hermes process; "
+                "running without graph memory in this process to avoid "
+                "multi-writer corruption (MEMORY.md fallback still active)",
+                self._db_path,
+            )
+            self._db = None
+            return
+        self._db_lock_fd = lock_fd
+
         try:
             self._db = LadybugMemory(self._db_path, enable_entity_extraction=True)
             logger.info("Ladybug opened at %s (%d entries)", self._db_path, self._db.count())
@@ -470,6 +501,18 @@ class LadybugMemoryProvider(MemoryProvider):
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=5.0)
         self._db = None
+        # Release the single-writer lock so the next Hermes process can
+        # take over the graph DB.
+        lock_fd = getattr(self, "_db_lock_fd", None)
+        if lock_fd is not None:
+            import fcntl
+            import os
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except OSError:
+                pass
+            self._db_lock_fd = None
 
     # -- System prompt -------------------------------------------------------
 
