@@ -323,6 +323,8 @@ class LadybugMemoryProvider(MemoryProvider):
     def __init__(self):
         self._db: Optional[Any] = None          # LadybugMemory instance
         self._db_path: str = ""
+        self._lock_fd: Optional[int] = None     # single-writer guard fd
+        self._degraded_reason: str = ""
         self._prefetch_limit: int = 6
         self._min_importance: int = 3
         self._auto_link: bool = False
@@ -392,6 +394,77 @@ class LadybugMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("Ladybug save_config failed: %s", e)
 
+    # -- Single-writer guard -------------------------------------------------
+    #
+    # LadybugDB is single-writer by design: "there cannot be multiple Database
+    # objects created with the same database path." Every live Hermes process
+    # (gateway + CLI/TUI sessions + cron workers) loads this plugin, so without
+    # a cross-process guard they all open the same file. When one rewrites or
+    # grows it the others' mmap regions go stale and the next FTS scan faults
+    # (SIGBUS), or the WAL is left in a half-written state that no later open
+    # can replay ("Corrupted wal file. Read out invalid WAL record type").
+    #
+    # First process to take the flock owns the graph DB; the rest degrade to
+    # MEMORY.md-only, which is independent of Ladybug and loses nothing.
+    # Originally shipped as commit 821217b; dropped when the Aug 2026 upgrade
+    # replaced the plugin repo wholesale. Do not remove.
+
+    _LOCK_SUFFIX = ".hermes-writer.lock"
+
+    def _acquire_writer_lock(self) -> bool:
+        """Take the cross-process single-writer lock. True = this process owns the DB."""
+        import fcntl
+        import os
+
+        lock_path = self._db_path + self._LOCK_SUFFIX
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        except Exception as e:
+            self._degraded_reason = f"cannot open lock file {lock_path}: {e}"
+            logger.warning("Ladybug: %s", self._degraded_reason)
+            return False
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                holder = os.read(fd, 32).decode(errors="replace").strip() or "unknown pid"
+            except Exception:
+                holder = "unknown pid"
+            os.close(fd)
+            self._degraded_reason = (
+                f"another Hermes process ({holder}) already holds {self._db_path}; "
+                f"this session is MEMORY.md-only"
+            )
+            logger.warning("Ladybug single-writer guard: %s", self._degraded_reason)
+            return False
+
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, f"pid {os.getpid()}\n".encode())
+        except Exception:
+            pass
+        self._lock_fd = fd
+        logger.info("Ladybug single-writer lock acquired (pid %d)", os.getpid())
+        return True
+
+    def _release_writer_lock(self) -> None:
+        """Release the single-writer lock, if held."""
+        import fcntl
+        import os
+
+        fd, self._lock_fd = self._lock_fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
     # -- Lifecycle -----------------------------------------------------------
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -428,6 +501,11 @@ class LadybugMemoryProvider(MemoryProvider):
         self._min_importance = int(plugin_cfg.get("min_importance", 3))
         self._auto_link = str(plugin_cfg.get("auto_link", "false")).lower() == "true"
 
+        # Single-writer guard: only the lock holder may open the graph DB.
+        if not self._acquire_writer_lock():
+            self._db = None
+            return
+
         try:
             self._db = LadybugMemory(self._db_path, enable_entity_extraction=True)
             logger.info("Ladybug opened at %s (%d entries)", self._db_path, self._db.count())
@@ -448,9 +526,13 @@ class LadybugMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("Ladybug failed to open %s: %s", self._db_path, e)
                 self._db = None
+                self._degraded_reason = f"open failed: {e}"
+                self._release_writer_lock()
         except Exception as e:
             logger.warning("Ladybug failed to open %s: %s", self._db_path, e)
             self._db = None
+            self._degraded_reason = f"open failed: {e}"
+            self._release_writer_lock()
 
     @staticmethod
     def _load_plugin_config(hermes_home: str) -> dict:
@@ -470,6 +552,7 @@ class LadybugMemoryProvider(MemoryProvider):
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=5.0)
         self._db = None
+        self._release_writer_lock()
 
     # -- System prompt -------------------------------------------------------
 
@@ -568,7 +651,10 @@ class LadybugMemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if not self._db:
-            return json.dumps({"error": "Ladybug database is not initialised."})
+            msg = "Ladybug database is not initialised."
+            if self._degraded_reason:
+                msg += f" ({self._degraded_reason})"
+            return json.dumps({"error": msg})
 
         try:
             if tool_name == "ladybug_store":
